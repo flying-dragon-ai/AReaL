@@ -12,10 +12,15 @@ from typing import Any
 
 import torch
 import torch.distributed as dist
+from torch.nn.attention.flex_attention import BlockMask
 
 from areal.api.cli_args import MicroBatchSpec
 from areal.models.tree_attn.constants import BLOCK_SIZE
 from areal.models.tree_attn.module_fsdp import create_block_mask_from_dense
+from areal.models.tree_attn.triton_kernel import (
+    TreeAttentionData,
+    precompute_tree_attention_data,
+)
 from areal.utils import logging, stats_tracker
 from areal.utils.data import MicroBatchList
 from areal.utils.perf_tracer import trace_perf, trace_scope
@@ -219,6 +224,42 @@ def _compress_trie(root: _BuildNode) -> TrieNode:
     return trie_root
 
 
+def trie_to_parent_array(trie: TrieNode, max_tokens: int) -> torch.Tensor:
+    """Build a parent array from TrieNode structure.
+
+    The parent array `fa` is a 1D tensor where `fa[i]` is the index of the
+    parent token of token `i`. For root tokens, the parent index is -1.
+    In this tree structure, all tokens within a compressed trie node
+    share the same parent, which is the last token of the parent node.
+
+    Args:
+        trie: The root TrieNode.
+        max_tokens: Maximum number of tokens (length of the output tensor).
+
+    Returns:
+        torch.Tensor: Parent array of shape (1, max_tokens) with dtype int32.
+    """
+    fa = torch.full((1, max_tokens), -1, dtype=torch.int32)
+
+    if not trie.nodes:  # Empty/dummy trie
+        return fa
+
+    for node in trie.nodes:
+        parent_end_pos = -1
+        if node.ancestors:  # Has parent
+            parent_node = node.ancestors[-1]  # Last ancestor is parent
+            parent_end_pos = parent_node.end_idx
+
+        # First token in node attends to parent; internal tokens attend to previous token
+        if node.start_idx >= 0 and node.start_idx < max_tokens:
+            fa[0, node.start_idx] = parent_end_pos
+        for pos in range(node.start_idx + 1, node.end_idx + 1):
+            if pos < max_tokens:
+                fa[0, pos] = pos - 1
+
+    return fa
+
+
 # =============================================================================
 # Public API
 # =============================================================================
@@ -370,12 +411,6 @@ def build_packed_tree_batch(
                 mask_template.device,
             )
 
-        # Create block mask from dense mask
-        with trace_scope("tree_attn.create_block_mask"):
-            block_mask = create_block_mask_from_dense(
-                attention_mask, padded_size, mask_template.device
-            )
-
         # Compute position_ids (needs dense attention_mask)
         with trace_scope("tree_attn.get_position_ids"):
             position_ids = get_packed_tree_position_ids(
@@ -384,6 +419,7 @@ def build_packed_tree_batch(
             )
 
         # Release dense attention mask memory after position_ids are computed
+        # Block mask will be lazily created in forward_backward_batch
         del attention_mask
 
         # Pack extra data
@@ -396,10 +432,8 @@ def build_packed_tree_batch(
                 non_packable_keys,
             )
 
-        # Build micro-batch dict with block_mask
         mb = {
             "input_ids": input_ids,
-            "block_mask": block_mask,
             "position_ids": position_ids,
             "trie_node": trie,
             **extra_data,
@@ -514,14 +548,23 @@ def _pack_input_ids(
     return input_ids.unsqueeze(0)
 
 
+# Block size for memory-efficient attention mask building.
+# tril_indices for a block of this size uses ~32MB (2048*2048/2 * 2 tensors * 4 bytes).
+_ATTN_MASK_BLOCK_SIZE = 2048
+
+
 def _build_attention_mask(
     trie: TrieNode,
     max_tokens: int,
     device: torch.device,
 ) -> torch.Tensor:
-    """Build 2D attention mask from trie structure."""
+    """Build 2D attention mask from trie structure.
+
+    Uses blockwise processing for large sequences to limit memory usage.
+    For a sequence of length N, instead of creating tril_indices(N, N) which
+    uses O(N^2) memory, we process in blocks of size B, each using O(B^2) memory.
+    """
     mask = torch.zeros((max_tokens, max_tokens), dtype=torch.bool, device=device)
-    tril_cache: dict[int, tuple[torch.Tensor, torch.Tensor]] = {}
 
     for seq_id in trie.all_sequence_ids:
         # Get all tree index ranges for this sequence
@@ -543,16 +586,74 @@ def _build_attention_mask(
         if seq_len == 0:
             continue
 
-        # Get or create lower triangular indices
-        rows_cols = tril_cache.get(seq_len)
-        if rows_cols is None:
-            rows_cols = torch.tril_indices(seq_len, seq_len, device=device)
-            tril_cache[seq_len] = rows_cols
-        rows, cols = rows_cols
+        # Apply causal mask in blocks to limit memory usage
+        _apply_causal_mask_blockwise(mask, positions, seq_len, device)
 
-        # Set causal mask entries
-        mask[positions[rows], positions[cols]] = True
     return mask
+
+
+def _apply_causal_mask_blockwise(
+    mask: torch.Tensor,
+    positions: torch.Tensor,
+    seq_len: int,
+    device: torch.device,
+) -> None:
+    """Apply causal mask entries blockwise to limit memory usage.
+
+    Instead of creating one huge tril_indices(seq_len, seq_len), we process
+    the lower triangular matrix in blocks. For each block, we compute the
+    valid (row, col) pairs where row >= col (causal) and set mask entries.
+
+    The lower triangular matrix is divided into:
+    1. Diagonal blocks: square blocks along the diagonal
+    2. Off-diagonal blocks: rectangular blocks below the diagonal
+
+    For a 6x6 matrix with block_size=2:
+        [D0  .   . ]
+        [B10 D1  . ]
+        [B20 B21 D2]
+
+    Where D0, D1, D2 are diagonal blocks (lower triangular within)
+    and B10, B20, B21 are fully dense blocks.
+    """
+    block_size = _ATTN_MASK_BLOCK_SIZE
+    num_blocks = (seq_len + block_size - 1) // block_size
+
+    for block_row in range(num_blocks):
+        row_start = block_row * block_size
+        row_end = min((block_row + 1) * block_size, seq_len)
+        row_len = row_end - row_start
+
+        # Process diagonal block (lower triangular within block)
+        # These are positions where block_row == block_col
+        tril = torch.tril_indices(row_len, row_len, device=device, dtype=torch.int32)
+        local_rows, local_cols = tril
+        global_rows = row_start + local_rows
+        global_cols = row_start + local_cols
+        mask[positions[global_rows], positions[global_cols]] = True
+        del tril, local_rows, local_cols, global_rows, global_cols
+
+        # Process off-diagonal blocks (fully dense, all entries valid)
+        # These are positions where block_row > block_col
+        for block_col in range(block_row):
+            col_start = block_col * block_size
+            col_end = min((block_col + 1) * block_size, seq_len)
+
+            # Create meshgrid for this block - all (row, col) pairs are valid
+            # since row >= row_start > col_end > col for off-diagonal blocks
+            block_rows = torch.arange(
+                row_start, row_end, device=device, dtype=torch.int32
+            )
+            block_cols = torch.arange(
+                col_start, col_end, device=device, dtype=torch.int32
+            )
+
+            # Use broadcasting to set all entries in this block
+            # positions[block_rows] gives row indices, positions[block_cols] gives col indices
+            row_positions = positions[block_rows].unsqueeze(1)  # [row_len, 1]
+            col_positions = positions[block_cols].unsqueeze(0)  # [1, col_len]
+            mask[row_positions, col_positions] = True
+            del block_rows, block_cols, row_positions, col_positions
 
 
 def _pack_extra_data(
@@ -611,3 +712,136 @@ def get_packed_tree_position_ids(
         position_ids = torch.clamp_min(ancestor_counts - 1, 0)
 
     return position_ids.unsqueeze(0)
+
+
+@trace_perf("tree_attn.build_block_mask_from_trie")
+def build_block_mask_from_trie(
+    trie: TrieNode,
+    padded_size: int,
+    device: torch.device,
+) -> BlockMask:
+    """Lazily build a block mask from a trie node.
+
+    This function builds the dense attention mask from the trie structure and
+    converts it to a block mask for use with flex attention. It should be called
+    just before the forward pass to minimize memory usage.
+
+    Parameters
+    ----------
+    trie : TrieNode
+        The root trie node containing the tree structure.
+    padded_size : int
+        The padded sequence length.
+    device : torch.device
+        Device to create the block mask on.
+
+    Returns
+    -------
+    BlockMask
+        The created block mask for use with flex_attention.
+    """
+    # Handle dummy trie (empty tree for DP synchronization)
+    if not trie.all_sequence_ids:
+        # Create a minimal valid block mask for empty trees
+        dummy_mask = torch.zeros(
+            (padded_size, padded_size), dtype=torch.bool, device=device
+        )
+        return create_block_mask_from_dense(dummy_mask, padded_size, device)
+
+    with trace_scope("tree_attn.build_attention_mask"):
+        attention_mask = _build_attention_mask(trie, padded_size, device)
+
+    with trace_scope("tree_attn.create_block_mask"):
+        block_mask = create_block_mask_from_dense(attention_mask, padded_size, device)
+
+    # Release dense attention mask memory
+    del attention_mask
+
+    return block_mask
+
+
+@trace_perf("tree_attn.build_attention_mask_from_trie")
+def build_attention_mask_from_trie(
+    trie: TrieNode,
+    padded_size: int,
+    device: torch.device,
+) -> torch.Tensor:
+    """Build a dense attention mask tensor from a trie node.
+
+    This function builds the dense attention mask from the trie structure.
+    Unlike build_block_mask_from_trie, this returns a torch.Tensor that can
+    be saved by gradient checkpointing mechanisms.
+
+    This is useful for Megatron engine where gradient checkpointing requires
+    all forward arguments to be tensors (BlockMask cannot be saved by
+    save_for_backward). The BlockMask can be created inside the attention
+    module from this dense tensor.
+
+    Parameters
+    ----------
+    trie : TrieNode
+        The root trie node containing the tree structure.
+    padded_size : int
+        The padded sequence length.
+    device : torch.device
+        Device to create the attention mask on.
+
+    Returns
+    -------
+    torch.Tensor
+        Dense attention mask of shape (padded_size, padded_size) with dtype bool.
+    """
+    # Handle dummy trie (empty tree for DP synchronization)
+    if not trie.all_sequence_ids:
+        return torch.zeros((padded_size, padded_size), dtype=torch.bool, device=device)
+
+    with trace_scope("tree_attn.build_attention_mask"):
+        attention_mask = _build_attention_mask(trie, padded_size, device)
+
+    return attention_mask
+
+
+@trace_perf("tree_attn.build_triton_attn_data_from_trie")
+def build_triton_attn_data_from_trie(
+    trie: TrieNode,
+    padded_size: int,
+) -> TreeAttentionData:
+    """Lazily build Triton tree attention data from a trie node.
+
+    This function builds the parent array from the trie structure and
+    precomputes packed masks and sparse block indices for Triton kernels.
+
+    Parameters
+    ----------
+    trie : TrieNode
+        The root trie node containing the tree structure.
+    padded_size : int
+        The padded sequence length.
+
+    Returns
+    -------
+    TreeAttentionData
+        The precomputed Triton attention data.
+    """
+    # Handle dummy trie (empty tree for DP synchronization)
+    if not trie.all_sequence_ids:
+        num_words = (padded_size + 63) >> 6
+        num_q_blocks = (padded_size + 128 - 1) // 128
+        num_kv_blocks = num_words
+        packed_mask = torch.zeros((1, padded_size, num_words), dtype=torch.int64)
+        kv_indices = torch.zeros((0,), dtype=torch.int32)
+        kv_offsets = torch.zeros((1, num_q_blocks + 1), dtype=torch.int32)
+        q_indices = torch.zeros((0,), dtype=torch.int32)
+        q_offsets = torch.zeros((1, num_kv_blocks + 1), dtype=torch.int32)
+        return TreeAttentionData(
+            packed_mask=packed_mask,
+            kv_indices=kv_indices,
+            kv_offsets=kv_offsets,
+            q_indices=q_indices,
+            q_offsets=q_offsets,
+        )
+
+    with trace_scope("tree_attn.precompute_triton_data"):
+        fa = trie_to_parent_array(trie, padded_size)
+        triton_attn_data = precompute_tree_attention_data(fa)
+    return triton_attn_data

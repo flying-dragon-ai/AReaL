@@ -1,7 +1,7 @@
 import asyncio
 import getpass
-import os
 import re
+import shlex
 import subprocess
 import time
 from dataclasses import dataclass
@@ -33,6 +33,7 @@ from areal.scheduler.exceptions import (
 from areal.scheduler.rpc.serialization import deserialize_value, serialize_value
 from areal.utils import logging, name_resolve, names
 from areal.utils.concurrent import run_async_task
+from areal.utils.fs import validate_shared_path
 from areal.utils.http import get_default_connector
 from areal.utils.launcher import (
     JobState,
@@ -72,7 +73,6 @@ class SlurmScheduler(Scheduler):
         fileroot: str | None = None,
         cluster_name: str | None = None,
         container_type: str = "apptainer",
-        container_image: str | None = "/storage/openpsi/images/areal-latest.sif",
         container_mounts: str | None = "/storage:/storage",
         srun_additional_args: str = "--unbuffered --mpi=pmi2 -K --chdir $PWD",
         startup_timeout: float = 300.0,
@@ -112,6 +112,14 @@ class SlurmScheduler(Scheduler):
         if exp_config is not None:
             self.name_resolve_config = exp_config.cluster.name_resolve
 
+        if self.fileroot:
+            validate_shared_path(self.fileroot, "cluster.fileroot")
+        if self.name_resolve_config.type == "nfs":
+            validate_shared_path(
+                self.name_resolve_config.nfs_record_root,
+                "name_resolve.nfs_record_root",
+            )
+
         # Reconfigure name_resolve and clear old entries
         if self.experiment_name and self.trial_name:
             name_resolve.reconfigure(self.name_resolve_config)
@@ -120,7 +128,6 @@ class SlurmScheduler(Scheduler):
             )
 
         self.container_type = container_type
-        self.container_image = container_image
         self.container_mounts = container_mounts
         self.srun_additional_args = srun_additional_args
         self.startup_timeout = startup_timeout
@@ -364,33 +371,6 @@ class SlurmScheduler(Scheduler):
                 worker_ports += list(map(str, resp.json()["ports"]))
 
             logger.debug(f"Discovered {worker_info.worker.id} at {addr}")
-            if worker_info.spec.gpu == 0:
-                continue
-
-            # Set CUDA_VISIBLE_DEVICES
-            n_workers_per_node = max(1, self.n_gpus_per_node // worker_info.spec.gpu)
-            local_idx = worker_info.task_index % n_workers_per_node
-            gpus_per_task = min(worker_info.spec.gpu, self.n_gpus_per_node)
-            visible_deivces = list(
-                map(
-                    str,
-                    list(
-                        range(
-                            local_idx * gpus_per_task, (local_idx + 1) * gpus_per_task
-                        )
-                    ),
-                )
-            )
-            resp = requests.post(
-                f"http://{addr}/set_env",
-                json=dict(
-                    env=dict(
-                        CUDA_VISIBLE_DEVICES=",".join(visible_deivces),
-                        ASCEND_RT_VISIBLE_DEVICES=",".join(visible_deivces),
-                    )
-                ),
-            )
-            resp.raise_for_status()
 
     def _prepare_worker_specs(
         self, role: str, num_workers: int, schedulings: list[SchedulingSpec] | None
@@ -402,10 +382,9 @@ class SlurmScheduler(Scheduler):
         # Amend environment variables
         for sch in schedulings:
             # AReaL env var forwarding
-            sch.env_vars["AREAL_RECOVER_RUN"] = os.getenv("AREAL_RECOVER_RUN", str(0))
             if self.enable_tms_offload:
                 sch.env_vars.update(get_tms_env_vars())
-            sch.env_vars.update(get_env_vars(self.cluster_name))
+            sch.env_vars.update(get_env_vars())
             thread_env = get_thread_env_vars(
                 cpus_per_task=sch.cpu,
                 existing_env_vars=sch.env_vars,
@@ -798,6 +777,33 @@ class SlurmScheduler(Scheduler):
         # Build environment variables (common to all workers)
         env_vars_dict = spec.env_vars.copy() if spec.env_vars else {}
 
+        bash_cmds = (spec.additional_bash_cmds or []).copy()
+
+        # Set CUDA_VISIBLE_DEVICES based on SLURM_LOCALID before any Python imports.
+        # This MUST happen before Python starts, otherwise CUDA runtime ignores the
+        # env var change once it's initialized.
+        # We use bash commands instead of env_vars_dict because SLURM_LOCALID is only
+        # available at runtime and each task needs a different value.
+        if total_gpus > 0:
+            gpus_per_task = spec.gpu
+            if gpus_per_task == 1:
+                cuda_setup_cmd = (
+                    f"export CUDA_VISIBLE_DEVICES=$((SLURM_LOCALID * {gpus_per_task}))"
+                )
+            else:
+                cuda_setup_cmd = (
+                    f"export CUDA_VISIBLE_DEVICES=$(seq -s, $((SLURM_LOCALID * {gpus_per_task})) "
+                    f"$((SLURM_LOCALID * {gpus_per_task} + {gpus_per_task} - 1)))"
+                )
+            # Also set ASCEND_RT_VISIBLE_DEVICES for Ascend NPU compatibility
+            ascend_setup_cmd = "export ASCEND_RT_VISIBLE_DEVICES=$CUDA_VISIBLE_DEVICES"
+            bash_cmds.insert(0, cuda_setup_cmd)
+            bash_cmds.insert(1, ascend_setup_cmd)
+
+        bash_cmds.append(rpc_cmd)
+        bash_cmds_str = ";\n".join(bash_cmds)
+        cmd = f"bash -c {shlex.quote(bash_cmds_str)}"
+
         # Build final command and export string
         if self.container_type == "apptainer":
             # For apptainer, pass env vars to singularity
@@ -806,10 +812,10 @@ class SlurmScheduler(Scheduler):
             if self.container_mounts:
                 final_cmd += f" --bind {self.container_mounts}"
             final_cmd += f" {env_string}"
-            final_cmd += f" {self.container_image}"
-            final_cmd += f" {rpc_cmd}"
+            final_cmd += f" {spec.image}"
+            final_cmd += f" {cmd}"
         else:  # native
-            final_cmd = rpc_cmd
+            final_cmd = cmd
 
         srun_flags = [
             f"--nodes={nodes}",

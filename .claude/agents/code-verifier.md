@@ -34,10 +34,10 @@ git diff --name-only HEAD
 
 Categorize changes:
 
-- Python files (`.py`) → Run Ruff, tests
-- Markdown files (`.md`) → Run mdformat
-- Config files (`.yaml`, `.json`, `.toml`) → Validate syntax
-- API changes (`areal/api/`) → Regenerate CLI docs
+- Python files (`.py`) -> Run Ruff, tests
+- Markdown files (`.md`) -> Run mdformat
+- Config files (`.yaml`, `.json`, `.toml`) -> Validate syntax
+- API changes (`areal/api/`) -> Regenerate CLI docs
 
 ### Phase 2: Run Formatting & Linting
 
@@ -64,6 +64,9 @@ pre-commit run --files <file1> <file2>
 For Python changes, identify relevant tests:
 
 ```bash
+# First, check if GPU is available
+python -c "import torch; print('GPU available:', torch.cuda.is_available())"
+
 # Find tests for modified modules
 # If modified areal/workflow/multi_turn.py, run:
 uv run pytest areal/tests/test_workflow.py -v
@@ -80,6 +83,9 @@ uv run pytest areal/tests/test_utils.py -v
 | GRPO tests  | `pytest areal/tests/grpo/`          | Yes            |
 | FSDP tests  | `pytest areal/tests/test_fsdp_*.py` | Yes            |
 | Distributed | `pytest areal/tests/torchrun/`      | Yes, multi-GPU |
+
+**Auto-skip GPU tests when no GPU**: If GPU is not available, skip GPU-required test
+categories.
 
 ### Phase 4: Documentation Checks
 
@@ -110,17 +116,17 @@ Output a clear summary:
 
 | Check | Status | Details |
 |-------|--------|---------|
-| Ruff (lint) | ✅ Pass | No issues |
-| Ruff (format) | ✅ Pass | Auto-fixed 2 files |
-| mdformat | ⏭️ Skipped | No .md changes |
-| Unit tests | ✅ Pass | 12 passed |
-| GPU tests | ⏭️ Skipped | No GPU available |
+| Ruff (lint) | [PASS] | No issues |
+| Ruff (format) | [PASS] | Auto-fixed 2 files |
+| mdformat | [SKIP] | No .md changes |
+| Unit tests | [PASS] | 12 passed |
+| GPU tests | [SKIP] | No GPU available |
 
 ### Issues Found
 None
 
 ### Ready to Commit
-✅ Yes - All checks passed
+[YES] - All checks passed
 ```
 
 ## Auto-Fix Behavior
@@ -158,6 +164,7 @@ After auto-fix, remind user:
 
 If tests cannot be run locally:
 
+1. First check GPU availability
 1. Document which tests were skipped
 1. Explain why (GPU, multi-node, etc.)
 1. Note that CI will run them

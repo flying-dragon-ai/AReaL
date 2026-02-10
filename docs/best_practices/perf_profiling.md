@@ -20,8 +20,8 @@ making it easy to correlate computation, communication, and I/O across multiple 
 
 ### 1. Enable tracing in your config
 
-Add a [`PerfTracerConfig`](../cli_reference.md#section-perf-tracer) to your training
-script's YAML config or CLI overrides:
+Add a {ref}`PerfTracerConfig <section-perf-tracer>` to your training script's YAML
+config or CLI overrides:
 
 ```yaml
 perf_tracer:
@@ -57,7 +57,7 @@ Execute your training script as usual. The tracer automatically writes events to
 produces its own file.
 
 ```bash
-python -m areal.launcher.local examples/math/gsm8k_rl.py --config examples/math/gsm8k_grpo.yaml
+python examples/math/gsm8k_rl.py --config examples/math/gsm8k_grpo.yaml scheduler.type=local
 ```
 
 ### 4. View traces in Perfetto
@@ -136,7 +136,7 @@ does a single prompt take from submission to reward calculation?).
 **Example** (from `areal/workflow/rlvr.py`):
 
 ```python
-from areal.core import workflow_context
+from areal import workflow_context
 from areal.utils.perf_tracer import (
     atrace_session_phase,
     session_context,
@@ -283,7 +283,7 @@ snapshot").
 - Creates a point-in-time marker (not a duration)
 - Useful for events that don't have a meaningful duration
 
-**Example** (from `areal/core/workflow_executor.py`):
+**Example** (from `areal/infra/workflow_executor.py`):
 
 ```python
 perf_tracer.instant(
@@ -316,7 +316,7 @@ consumption).
 - Parameters: Use `session_id=` to target a specific session, or `task_id=` to target
   all sessions in a task
 
-**Example** (from `areal/core/workflow_executor.py`):
+**Example** (from `areal/infra/workflow_executor.py`):
 
 ```python
 from areal.utils.perf_tracer import trace_session_event
@@ -547,7 +547,7 @@ Handle errors internally and return error responses instead.
 
 ## See also
 
-- [CLI Reference: PerfTracerConfig](../cli_reference.md#section-perf-tracer)
+- {ref}`CLI Reference: PerfTracerConfig <section-perf-tracer>`
 - [Workflow customization guide](../customization/agent.md)
 - [Chrome Trace Event Format](https://docs.google.com/document/d/1CvAClvFfyA5R-PhYUmn5OOQtYMH4h6I0nSsKchNAySU/)
 - [Perfetto UI](https://ui.perfetto.dev/)

@@ -25,7 +25,7 @@ resources:
   cpus: 8+
   memory: 32GB+
   disk_size: 256GB
-  image_id: docker:ghcr.io/inclusionai/areal-runtime:v0.5.2
+  image_id: docker:ghcr.io/inclusionai/areal-runtime:v0.5.3
 
 num_nodes: 1
 
@@ -37,8 +37,9 @@ file_mounts:
 workdir: .
 
 run: |
-  python3 -m areal.launcher.local examples/math/gsm8k_rl.py \
+  python3 examples/math/gsm8k_rl.py \
     --config examples/math/gsm8k_grpo.yaml \
+    scheduler.type=local \
     experiment_name=gsm8k-grpo \
     trial_name=trial0 \
     cluster.n_nodes=1 \
@@ -76,7 +77,7 @@ Specify the resources and image used to run the experiment.
 ```yaml
 resources:
   accelerators: A100:8
-  image_id: docker:ghcr.io/inclusionai/areal-runtime:v0.5.2
+  image_id: docker:ghcr.io/inclusionai/areal-runtime:v0.5.3
   memory: 256+
   cpus: 32+
 
@@ -130,8 +131,9 @@ run: |
     done
 
     echo "Executing training script on head node..."
-    python3 -m areal.launcher.ray examples/math/gsm8k_rl.py \
+    python3 examples/math/gsm8k_rl.py \
             --config examples/skypilot/gsm8k_grpo_ray.yaml \
+            scheduler.type=ray \
             experiment_name=gsm8k-grpo \
             trial_name=trial0 \
             cluster.n_nodes=$SKYPILOT_NUM_NODES \

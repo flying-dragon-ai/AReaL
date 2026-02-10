@@ -8,6 +8,7 @@ from pathlib import Path
 from datasets import load_dataset
 from transformers import PreTrainedTokenizerFast
 
+from areal import PPOTrainer, workflow_context
 from areal.api.cli_args import (
     GenerationHyperparameters,
     GRPOConfig,
@@ -15,10 +16,8 @@ from areal.api.cli_args import (
     load_expr_config,
 )
 from areal.api.workflow_api import RolloutWorkflow
-from areal.core import workflow_context
 from areal.engine.sglang_remote import RemoteSGLangEngine
 from areal.experimental.openai import ArealOpenAI
-from areal.experimental.trainer import PPOTrainer
 from areal.utils import logging, stats_tracker
 from areal.utils.hf_utils import load_hf_tokenizer
 

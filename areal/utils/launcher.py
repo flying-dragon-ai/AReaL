@@ -3,14 +3,12 @@ import enum
 import getpass
 import os
 import pathlib
-import shutil
-import subprocess
 import sys
 import time
-from pathlib import Path
 
 from areal.api.alloc_mode import AllocationMode, AllocationType
-from areal.utils import logging, name_resolve, names, pkg_version
+from areal.utils import logging, name_resolve, names
+from areal.utils.fs import validate_shared_path
 
 logger = logging.getLogger("LauncherUtils")
 
@@ -38,7 +36,6 @@ BASE_ENVIRONS = {
     "TRITON_CACHE_DIR": TRITON_CACHE_PATH,
     "VLLM_CACHE_ROOT": VLLM_CACHE_ROOT,
     "CUDA_DEVICE_MAX_CONNECTIONS": "1",
-    "PYTHONPATH": PYTHONPATH,
 }
 
 # Thread control environment variables for OpenMP/MKL/etc.
@@ -121,17 +118,40 @@ def get_scheduling_spec(config_part):
         return SchedulingSpec()
 
 
-def get_env_vars(
-    cluster_name: str, additional_env_vars: str | None = None
-) -> dict[str, str]:
-    """Returns the environment variables for the cluster."""
+def get_env_vars(additional_env_vars: str | None = None) -> dict[str, str]:
+    """Returns the environment variables for the cluster.
+
+    This function dynamically captures the current Python path (sys.path) to ensure
+    that spawned worker processes can import modules from the same locations as the
+    parent process. This is essential for deserializing custom config classes defined
+    outside the areal package (e.g., in examples/).
+    """
     _additional_env_vars = (
         dict(item.split("=") for item in additional_env_vars.split(","))
         if additional_env_vars
         else dict()
     )
 
-    return {**BASE_ENVIRONS, **_additional_env_vars}
+    # Dynamically build PYTHONPATH from current sys.path to ensure workers
+    # can import custom modules in controller mode
+    all_paths = []
+    # The order of paths is important for module resolution.
+    # 1. Current working directory.
+    all_paths.append(os.getcwd())
+
+    # 2. All paths from sys.path (excluding empty strings and zip files).
+    all_paths.extend(p for p in sys.path if p and not p.endswith(".zip"))
+
+    # 3. Original PYTHONPATH for completeness.
+    if PYTHONPATH:
+        all_paths.extend(p for p in PYTHONPATH.split(os.pathsep) if p)
+
+    # Remove duplicates while preserving order
+    pythonpath_parts = list(dict.fromkeys(all_paths))
+
+    dynamic_pythonpath = os.pathsep.join(pythonpath_parts)
+
+    return {**BASE_ENVIRONS, "PYTHONPATH": dynamic_pythonpath, **_additional_env_vars}
 
 
 class JobState(enum.Enum):
@@ -207,6 +227,13 @@ def validate_config_for_launcher(config):
                 "remove the inference part from `allocation_mode`."
             )
 
+    validate_shared_path(config.cluster.fileroot, "cluster.fileroot")
+    if config.cluster.name_resolve.type == "nfs":
+        validate_shared_path(
+            config.cluster.name_resolve.nfs_record_root,
+            "name_resolve.nfs_record_root",
+        )
+
 
 def validate_config_for_distributed_launcher(config):
     validate_config_for_launcher(config)
@@ -236,66 +263,3 @@ def validate_config_for_distributed_launcher(config):
             )
         if allocation_mode.gen.tp_size > config.cluster.n_gpus_per_node:
             raise ValueError("Currently only support vLLM TP size <= #GPUs per node.")
-
-
-def apply_sglang_patch():
-    p = Path(os.path.dirname(__file__))
-    patch_path = str(
-        p.parent.parent
-        / "patch"
-        / "sglang"
-        / f"v{pkg_version.get_version('sglang')}.patch"
-    )
-    target_path = None
-    sglang_meta = subprocess.check_output(
-        [sys.executable, "-m", "pip", "show", "sglang"]
-    ).decode("utf-8")
-    # Prioritize editable install location, since pip show lists both locations
-    # if installed in editable mode.
-    for line in sglang_meta.split("\n"):
-        line = line.strip()
-        if line.startswith("Editable project location: "):
-            target_path = str(Path(line.split(": ")[1]) / "sglang")
-            break
-    else:
-        for line in sglang_meta.split("\n"):
-            line = line.strip()
-            if line.startswith("Location: "):
-                target_path = str(Path(line.split(": ")[1]) / "sglang")
-                break
-
-    if not target_path or not os.path.exists(target_path):
-        raise RuntimeError("Could not determine the installation path of SGLang.")
-
-    patch_binary = shutil.which("patch")
-    if not patch_binary:
-        raise RuntimeError(
-            "Could not locate the `patch` command; SGLang patch application failed."
-        )
-    result = subprocess.run(
-        [patch_binary, "-p1", "-N", "-i", patch_path],
-        cwd=target_path,
-        capture_output=True,
-        text=True,
-    )
-
-    output = (result.stdout or "") + (result.stderr or "")
-    if result.returncode == 0:
-        logger.info(f"Applied SGLang patch {patch_path} to {target_path}")
-    elif (
-        "Reversed (or previously applied) patch detected" in output
-        or "Skipping patch." in output
-    ):
-        logger.warning(
-            f"SGLang patch {patch_path} appears to be already applied for {target_path}."
-        )
-    else:
-        logger.error(
-            "Failed to apply SGLang patch %s to %s. Output:\n%s",
-            patch_path,
-            target_path,
-            output.strip(),
-        )
-        raise RuntimeError(
-            f"SGLang patch {patch_path} failed with exit code {result.returncode}."
-        )

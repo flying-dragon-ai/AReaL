@@ -9,10 +9,12 @@ from areal.experimental.models.archon.varlen_attention import (
     VarlenAttentionWrapper,
     varlen_attn,
 )
+from areal.models.tree_attn.module_archon import TreeAttentionWrapper
 
 __all__ = [
     "SDPAWrapper",
     "VarlenAttentionWrapper",
+    "TreeAttentionWrapper",
     "create_block_causal_mask_2d",
     "varlen_attn",
 ]
@@ -69,9 +71,6 @@ class SDPAWrapper(nn.Module):
     This wrapper supports packed sequences by creating a block-diagonal
     attention mask that combines causal masking with document boundary
     masking.
-
-    The mask is cached internally to avoid regeneration when the same
-    cu_seqlens structure is used repeatedly.
     """
 
     # Backend priority order
@@ -87,10 +86,6 @@ class SDPAWrapper(nn.Module):
         self.sdpa_backends = (
             sdpa_backends if sdpa_backends is not None else self.DEFAULT_BACKENDS
         )
-        # Cache for mask reuse
-        self._cached_mask: torch.Tensor | None = None
-        self._cached_cu_seqlens: torch.Tensor | None = None
-        self._cached_seq_len: int = 0
 
     def forward(
         self,
@@ -101,6 +96,7 @@ class SDPAWrapper(nn.Module):
         scale: float | None = None,
         cu_seqlens: torch.Tensor,
         max_seqlen: int,
+        **kwargs,  # Accept and ignore block_mask, triton_attn_data for API compatibility
     ) -> torch.Tensor:
         """Compute attention with block-diagonal causal mask.
 
@@ -111,12 +107,14 @@ class SDPAWrapper(nn.Module):
             scale: Optional scale factor for attention scores.
             cu_seqlens: Cumulative sequence lengths, shape [num_seqs + 1].
             max_seqlen: Maximum sequence length (unused, for API compatibility).
+            **kwargs: Additional arguments (block_mask, triton_attn_data) ignored.
 
         Returns:
             Attention output, shape [batch, heads, seq_len, head_dim]
         """
         seq_len = q.shape[2]
-        attn_mask = self._get_mask(cu_seqlens, seq_len, q.device, q.dtype)
+        # TODO: Mask should be precomputed and passed in, not computed here.
+        attn_mask = create_block_causal_mask_2d(cu_seqlens, seq_len, q.device, q.dtype)
 
         with sdpa_kernel(self.sdpa_backends, set_priority=True):
             return F.scaled_dot_product_attention(
@@ -128,40 +126,3 @@ class SDPAWrapper(nn.Module):
                 is_causal=False,
                 enable_gqa=q.size(1) != k.size(1),
             )
-
-    def _get_mask(
-        self,
-        cu_seqlens: torch.Tensor,
-        seq_len: int,
-        device: torch.device,
-        dtype: torch.dtype,
-    ) -> torch.Tensor:
-        """Get or create cached block-diagonal causal mask."""
-        # Check cache validity
-        if self._is_cache_valid(cu_seqlens, seq_len):
-            # Return cached mask, ensure correct dtype
-            if self._cached_mask.dtype != dtype:
-                return self._cached_mask.to(dtype)
-            return self._cached_mask
-
-        # Create new mask
-        mask = create_block_causal_mask_2d(cu_seqlens, seq_len, device, dtype)
-
-        # Update cache
-        self._cached_mask = mask
-        self._cached_cu_seqlens = cu_seqlens.clone()
-        self._cached_seq_len = seq_len
-
-        return mask
-
-    def _is_cache_valid(self, cu_seqlens: torch.Tensor, seq_len: int) -> bool:
-        """Check if the cached mask is still valid."""
-        if self._cached_mask is None:
-            return False
-        if self._cached_seq_len != seq_len:
-            return False
-        if self._cached_cu_seqlens is None:
-            return False
-        if self._cached_cu_seqlens.shape != cu_seqlens.shape:
-            return False
-        return torch.equal(self._cached_cu_seqlens, cu_seqlens)

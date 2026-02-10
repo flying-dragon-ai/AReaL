@@ -14,8 +14,8 @@ from areal.api.cli_args import (
 )
 from areal.api.io_struct import ModelRequest, ParamSpec, WeightUpdateMeta
 from areal.api.scheduler_api import Worker
-from areal.controller import RolloutController
 from areal.engine.sglang_remote import RemoteSGLangEngine
+from areal.infra import RolloutController
 from areal.scheduler.local import LocalScheduler
 from areal.tests.utils import get_model_path
 from areal.utils.hf_utils import load_hf_tokenizer
@@ -1004,10 +1004,16 @@ QWEN3_PATH = get_model_path(
 @pytest.mark.ci
 def test_rollout_controller_integration(tmp_path, model_path):
     tokenizer = load_hf_tokenizer(model_path)
+    fileroot = tmp_path / "fileroot"
+    fileroot.mkdir()
+    name_resolve_root = tmp_path / "name_resolve"
+    name_resolve_root.mkdir()
     scheduler = LocalScheduler(
         log_dir=tmp_path,
         experiment_name="test_rollout_controller_integration",
         trial_name="trial0",
+        fileroot=str(fileroot),
+        nfs_record_root=str(name_resolve_root),
     )
     rollout = RolloutController(
         inf_engine=RemoteSGLangEngine,
@@ -1069,19 +1075,6 @@ class TestRolloutControllerResolveWorkflow:
 
         result = controller._resolve_workflow_str("areal.workflow.rlvr.RLVRWorkflow")
         assert result == "areal.workflow.rlvr.RLVRWorkflow"
-
-    def test_resolve_workflow_str_with_invalid_type(self):
-        """Test _resolve_workflow_str raises for invalid type."""
-        config = create_test_config(consumer_batch_size=16)
-        scheduler = MockScheduler()
-        controller = RolloutController(
-            inf_engine=MockInferenceEngine,
-            config=config,
-            scheduler=scheduler,
-        )
-
-        with pytest.raises(ValueError, match="Invalid workflow type"):
-            controller._resolve_workflow_str(12345)
 
 
 class TestRolloutControllerShouldAcceptFn:

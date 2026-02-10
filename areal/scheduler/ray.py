@@ -41,7 +41,7 @@ def ray_resource_type():
     if torch.cuda.is_available():
         return "GPU"
 
-    from areal.platforms import is_npu_available
+    from areal.infra.platforms import is_npu_available
 
     if is_npu_available:
         return "NPU"
@@ -235,10 +235,7 @@ class RayScheduler(Scheduler):
         additional_envs_str = None
         if spec.env_vars:
             additional_envs_str = ",".join(f"{k}={v}" for k, v in spec.env_vars.items())
-        env = get_env_vars(
-            self.exp_config.cluster.cluster_name if self.exp_config else "",
-            additional_envs_str,
-        )
+        env = get_env_vars(additional_envs_str)
         thread_env = get_thread_env_vars(
             cpus_per_task=spec.cpu,
             existing_env_vars=spec.env_vars,
